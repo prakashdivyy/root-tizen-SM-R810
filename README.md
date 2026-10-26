@@ -90,7 +90,31 @@ The `pivot_switch` binary executes these steps during boot:
 
 ---
 
-## 3. Native SDB Root Privilege Escalation
+## 3. Tizen Security and Application Architecture Discoveries
+
+Reverse engineering revealed fundamental restrictions in Tizen security policies:
+
+### A. Hardcoded Root Privilege Checks in `pkgcmd`
+Standard non-root SDB sessions cannot delete or disable pre-installed system applications:
+- Running `pkgcmd -u -n com.samsung.wemail` fails with `Operation not allowed [-4]`.
+- Running `pkgcmd -D -t tpk -n com.samsung.wemail` fails with `Undefined Error [-999]`.
+- Disassembly of `/usr/bin/pkgcmd` revealed an explicit branch checking for root execution: `"This cmd is allowed for only root user"`.
+- Modifying system applications requires root privileges.
+
+### B. Partition Separation: System Apps vs. Preloaded User Apps
+Tizen organizes applications across two storage locations:
+- **System Applications (`/usr/apps/` in `rootfs.img`):** Read-only packages. Manifests mark these packages with `is_system=true` and `is_removable=false`. You cannot remove them without root permissions.
+- **Preloaded User Applications (`/opt/usr/apps/` in `user.img`):** Applications stored under `.preload-rw-tpk` (e.g., `com.samsung.retailmodeplayer`, `com.samsung.samsung-pay-app`, `com.samsung.w-magazine-wc1`, and `com.samsung.alti-barometer`). Standard non-root SDB can uninstall them immediately with `pkgcmd -u -n <pkgid>`.
+
+### C. Knox License Viewer Dependency in Standalone Setup
+- During standalone setup, confirming the 2nd PIN prompt triggers the Device Policy Manager (`org.tizen.dpm-syspopup`).
+- The manager starts `com.samsung.knox.license-viewer` to show legal agreements.
+- If you delete Knox packages from `rootfs.img`, the wizard stops on a black screen.
+- You must keep `com.samsung.knox.license-viewer`, `com.samsung.knoxcustom-exitui`, and `com.samsung.knoxenrollmentservice-efl` intact.
+
+---
+
+## 4. Native SDB Root Privilege Escalation
 
 Retail firmware restricts root access. The Smart Development Bridge daemon (`sdbd`) denies elevation commands.
 
@@ -124,7 +148,7 @@ root
 
 ---
 
-## 4. Standalone Setup and User Interface Configuration
+## 5. Standalone Setup and User Interface Configuration
 
 In standalone mode, the watch does not pair with a mobile device. Two software issues blocked the setup process:
 
@@ -140,9 +164,17 @@ In `/usr/apps/com.samsung.w-lockscreen-setting/bin/w-lockscreen-setting`:
 
 These modifications bypass the hardware encryption lock and store user PINs securely with SHA-256.
 
-### B. Navigation Stack Fix in `b2-setup-wizard`
-Tapping "Next" on the PIN screen caused a crash because the callback corrupted the CPU stack frame.
-- Re-engineer `_bottomButtonClickedCb` at offset `0x29010`. The code allocates `StuSettingUpViewController` (`0x2b918`), pushes the view (`0xcd40`), adjusts the stack (`add sp, #16`), and returns cleanly (`ldmia.w sp!, {r4-r8, pc}`).
+### B. Navigation Stack and Display Initialization in `b2-setup-wizard`
+During development, two major failure modes occurred:
+1. **Early Exit Failure:** Patching `_start` (`0xd230`) or `main` in `b2-setup-wizard` to `exit(0)` caused an unresponsive black screen. In Tizen, `b2-setup-wizard` is the primary display client started by `starter.service`. Exiting early terminates execution before Enlightenment and Wayland initialize the display surface.
+2. **Stack Frame Imbalance Crash:** Tapping "Next" on the PIN screen caused a CPU crash. `_bottomButtonClickedCb` allocated a 40-byte stack frame (`sub sp, #16; push {r4-r8, lr}`). Jumping to `0x28ed8` used `_lockScreenAppControlReplyCb`'s 56-byte stack teardown (`add sp, #28; pop {r4-r9, pc}`), corrupting the stack pointer by 16 bytes.
+
+**Resolution:**
+Re-engineer `_bottomButtonClickedCb` at offset `0x29010` with inline assembly:
+- Allocates and constructs `StuSettingUpViewController` (`0x2b918`).
+- Pushes the view to the naviframe controller (`0xcd40`).
+- Adjusts the stack pointer (`add sp, #16`).
+- Returns cleanly to the EFL event loop (`ldmia.w sp!, {r4-r8, pc}`).
 
 ### C. Remove Rotary Tutorial in `w-home`
 On first boot, `w-home` shows an overlay window to teach rotary bezel navigation. In standalone mode, this window does not register input listeners. It captures all touches and stops user input.
@@ -159,9 +191,13 @@ On first boot, `w-home` shows an overlay window to teach rotary bezel navigation
    vconftool set -t int "db/setting/setup_wizard_finish" 1 -f
    ```
 
+### D. Offline Debloat Registry Fragility
+Deleting application packages directly from `rootfs.img` before first boot caused setup failures. Tizen uses inter-dependent vconf keys and SQLite databases in `/opt`. Missing package registrations during enrollment cause startup deadlocks.
+- The reliable approach keeps a clean system rootfs image and performs live debloating with root privileges after first boot.
+
 ---
 
-## 5. Wi-Fi Subsystem Configuration
+## 6. Wi-Fi Subsystem Configuration
 
 ### Cause of Wi-Fi Failure
 On retail firmware, `net-config` calls Central Key Manager (CKM) functions to encrypt passphrases:
@@ -172,12 +208,15 @@ ckmc_decrypt_data(...);
 ```
 These functions require TrustZone applets. When you use the engineering bootloader, these applets are missing. The program stops with an error, and the Wi-Fi menu closes.
 
-### Resolution Steps:
-1. **Patch `/usr/bin/net-config`:**
-   Bypass the CKM functions and duplicate strings with `g_strdup`:
+### Technical Pitfalls and Resolutions:
+1. **Thumb/ARM State Transition Trap (`SIGILL`):**
+   Branching from Thumb-2 code with `b.w 0xa918` jumped into an ARM PLT stub without changing the processor instruction state (`T-bit`). This generated an Illegal Instruction fault (`SIGILL`) and killed `net-config`.
+   - The fix uses valid interworking: `push {lr}; blx 0xa918; pop {pc}` (`00 b5 de f7 2e ec 00 bd`).
+2. **Bypass CKM Functions in `/usr/bin/net-config`:**
+   Bypass AES encryption routines and return string duplicates with `g_strdup`:
    - Offset `0x2c0ca`: Change `df f8 c0 b2` to `04 46 ab e0` (`mov r4, r0; b 0x2c226`).
    - Offset `0x2bd3a`: Change `05 a9 05 46` to `06 46 d1 e0` (`mov r6, r0; b 0x2bee2`).
-2. **Restore Linux File Capabilities:**
+3. **Restore Linux File Capabilities:**
    Modifying the binary file removes POSIX file capabilities. You must apply them again manually:
    ```bash
    setcap cap_dac_override,cap_net_admin,cap_net_raw=ei /usr/bin/net-config
@@ -185,12 +224,13 @@ These functions require TrustZone applets. When you use the engineering bootload
    chown 551:551 /usr/bin/net-config
    chmod 0500 /usr/bin/net-config
    ```
-3. **Configure Automatic Radio Power:**
-   Set `[WiFi] Enable=true` in `/var/lib/connman/settings`. Ensure `/usr/apps/com.samsung.wifi/bin/wifi` contains the original code to power on the Broadcom radio before scanning.
+4. **Broadcom Hardware Radio Power Management:**
+   In stock `wifi_bin` at offset `0x24e0e`, if the radio was off, the UI showed `popup_scanning_show` without creating the scan list layout, causing a bounce-back to the main menu. Forcing `wifi_is_activated` to return 1 caused a `SIGSEGV` crash because register `r1` was uninitialized.
+   - The solution keeps the original `wifi_bin` binary to power on the Broadcom radio cleanly, sets `[WiFi] Enable=true` in `/var/lib/connman/settings`, and applies patches only to `net-config`.
 
 ---
 
-## 6. GNSS Location Subsystem Optimization
+## 7. GNSS Location Subsystem Optimization
 
 ### A. Remove the 10-Minute Boot Timeout
 After boot, the location service (`lbs-server`) stopped responding for 600 seconds. A debugger showed Thread 1 blocked in system call 168 (`SYS_poll`).
@@ -241,7 +281,7 @@ The GPS receiver acquires satellite signals in 1 to 3 seconds.
 
 ---
 
-## 7. Storage Partition Expansion
+## 8. Storage Partition Expansion
 
 The stock firmware image for `user.img` is 112 MB. Only 29 MB is free space. The custom `pivot_switch` bypasses the stock initrd script that resizes this filesystem.
 
@@ -255,7 +295,7 @@ This expands `/opt/usr` to the full boundary of **1.83 GB** (1.72 GB available).
 
 ---
 
-## 8. Operating System Debloat Procedure
+## 9. Operating System Debloat Procedure
 
 Use this three-layer structure to remove and deactivate unnecessary software:
 
@@ -359,7 +399,7 @@ This removes 150 MB of files from the read-only rootfs partition.
 
 ---
 
-## 9. Firmware Packaging and Flashing Procedure
+## 10. Firmware Packaging and Flashing Procedure
 
 Package the partition images into a standard POSIX `ustar` archive with root ownership (`0:0`). Append an Odin MD5 checksum to the archive.
 
@@ -375,7 +415,7 @@ Package the partition images into a standard POSIX `ustar` archive with root own
 8. user.img               (Stock Retail User Storage Base - 112 MB ext4)
 ```
 
-> **Important:** Use GNU tar to build the archive. Do not use macOS BSD tar. NetOdin rejects archives with non-standard POSIX pax headers.
+> **Important:** Use GNU tar to build the archive. Do not use macOS BSD tar. NetOdin rejects archives with non-standard POSIX pax headers (`uname` and `gname`) with error `RQT_Read fail`.
 
 ### Create the Package:
 ```bash
@@ -411,3 +451,31 @@ mv firmware.tar firmware.tar.md5
    Filesystem      Size  Used Avail Use% Mounted on
    /dev/mmcblk0p17 1.8G  112M  1.7G   6% /opt/usr
    ```
+
+---
+
+## 11. Emergency Recovery and Unbrick Procedures
+
+Use these procedures if the device stops responding or enters a boot loop:
+
+### A. Force Reset from Upload Mode or Hangs
+If the watch hangs on `Rebooting...` or enters kernel panic upload mode (`ECT PARA0021`):
+1. Press and hold the **Home/Power (bottom)** button continuously for 12 to 15 seconds.
+2. The hardware will perform a forced power reset.
+3. Release the button immediately when the display goes dark.
+4. Tap the button rapidly to open the Samsung Reboot Menu.
+
+### B. Recovery Wipe (Cache and Stale Database Clear)
+If the watch stops on the Samsung logo because of stale SQLite database entries in `/opt`:
+1. Enter the Samsung Reboot Menu.
+2. Select **Recovery**, then press and hold the Home/Power button.
+3. Stock recovery will start, clear cache partitions and user databases, and restart the setup wizard cleanly.
+
+### C. Revert to Factory Retail Firmware
+To restore the device to official factory stock:
+1. Load official stock firmware archives into NetOdin3:
+   - `AP`: `AP_R810XXU1GWE2_usr.tar.md5`
+   - `BL`: `BL_R810XXU1GWE2_usr.tar.md5`
+   - `CSC`: `CSC_OXA_R810OXA1GWE2_usr.tar.md5`
+2. Connect to the watch access point in Wireless Download Mode.
+3. Click **Start** to restore official retail software.
